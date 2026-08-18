@@ -1,5 +1,7 @@
 # uniwill-laptop-mr
 
+[![Made with DeepSeek Harness](https://img.shields.io/badge/Made%20with-DeepSeek%20Harness-4D6BFE?logo=deepseek&logoColor=white)](https://deepseek.com)
+
 Mechanical Revolution (Mechrevo / 机械革命) fork of the Uniwill laptop kernel driver.
 Forked to run alongside the mainline `uniwill-laptop` without module-name clashes.
 
@@ -84,3 +86,11 @@ Performance hotkey (WMI event `0xB0`, the physical key next to the power button)
 ## License
 
 GPL-2.0-or-later, copyright (C) 2025 Armin Wolf. Based on qc71_laptop and tuxedo-drivers.
+
+## Acknowledgements
+
+This project was built with [DeepSeek Harness](https://deepseek.com). The EC
+protocol reverse engineering (interop, register semantics, hotkey/light
+behavior) and the Linux driver implementation were carried out interactively
+with the DeepSeek Harness coding agent; on-device register measurements and
+feature validation were performed on the target machine itself.
