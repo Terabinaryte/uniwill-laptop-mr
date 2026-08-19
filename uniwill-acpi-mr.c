@@ -1356,7 +1356,9 @@ static ssize_t fan_sensitivity_show(struct device *dev, struct device_attribute 
 	if (!(value & FAN_SWITCH_SPEED_ENABLE))
 		return sysfs_emit(buf, "off\n");
 
-	return sysfs_emit(buf, "%u\n", (value & FAN_SWITCH_SPEED_MASK) * 100);
+	/* GENMASK()/BIT() expand to unsigned long; fold into a plain u32
+	 * before formatting so %u matches the actual type on every arch. */
+	return sysfs_emit(buf, "%u\n", (u32)(value & FAN_SWITCH_SPEED_MASK) * 100);
 }
 
 static ssize_t fan_sensitivity_store(struct device *dev, struct device_attribute *attr,
@@ -1375,7 +1377,7 @@ static ssize_t fan_sensitivity_store(struct device *dev, struct device_attribute
 		return -EINVAL;
 
 	return regmap_write(data->regmap, EC_ADDR_FAN_SWITCH_SPEED,
-			    (ms / 100) | FAN_SWITCH_SPEED_ENABLE);
+			    (u8)(ms / 100) | FAN_SWITCH_SPEED_ENABLE);
 }
 static DEVICE_ATTR_RW(fan_sensitivity);
 
