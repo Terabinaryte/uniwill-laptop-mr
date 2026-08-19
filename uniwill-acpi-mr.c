@@ -1556,6 +1556,7 @@ static umode_t uniwill_attr_is_visible(struct kobject *kobj, struct attribute *a
 
 	if (attr == &dev_attr_power_limits.attr ||
 	    attr == &dev_attr_tcc_offset.attr ||
+	    attr == &dev_attr_fan_sensitivity.attr ||
 	    attr == &dev_attr_fan_tables.attr) {
 		if (uniwill_device_supports(data, UNIWILL_FEATURE_PLATFORM_PROFILE))
 			return attr->mode;
