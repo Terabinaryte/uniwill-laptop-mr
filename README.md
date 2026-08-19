@@ -17,9 +17,23 @@ Mainline upstream: https://github.com/Wer-Wolf/uniwill-laptop
   - Verified on-device (2026-08): vendor `MECHREVO` + board `JIAOLONG Series-X6xR55xK`
     (`dmidecode`/sysfs: sys_vendor=MECHREVO, product=JIAOLONG Series, BIOS AMI N.1.40MRO56)
   - Exact match (vendor + board) so other Mechrevo models need their own entry
-- Default Mechrevo descriptor enables only HWMON + BATTERY features;
-  FN_LOCK/TOUCHPAD/LIGHTBAR to be enabled per-device after on-device verification
+- Default Mechrevo descriptor enables HWMON + BATTERY + PLATFORM_PROFILE +
+  SILENT_TURBO (custom-mode primitives always exposed); FN_LOCK/TOUCHPAD/
+  LIGHTBAR intentionally **not** enabled (see touchpad note below)
 - WMI GUID / ACPI ID unchanged (`ABBC0F72-...` / `INOU0000`) — hardware matching untouched
+
+## Touchpad note (important)
+
+The EC touchpad toggle bit (0x7A6 bit6) does **not** control the Linux
+I2C-HID touchpad device — writing it changes nothing on this machine (verified
+2026-08; TUXEDO's own control center hits the same wall). Touchpad enabling/
+disabling on Linux is a desktop-layer feature:
+
+- Wayland/GNOME: `gsettings set org.gnome.desktop.peripherals.touchpad send-events 'disabled'`
+- X11: `xinput disable <id>` (what TCC uses; works because X filters device events)
+- KDE Wayland: system settings touchpad toggle
+
+So the driver does not implement touchpad control at all.
 
 ## Build & install
 
@@ -66,6 +80,27 @@ daemon; the driver only exposes the EC registers):
 ```
 /sys/bus/platform/devices/INOU0000:00/power_limits    # "SPL SPPT FPPT" watts -> EC 0x783/784/785 (PL1>=75 also sets VRM 65/120)
 /sys/bus/platform/devices/INOU0000:00/tcc_offset      # TCC target temp in °C, 0..127 (bit7=enable) -> EC 0x786; write 0 to disable
+/sys/bus/platform/devices/INOU0000:00/fan_sensitivity  # fan curve step interval in ms (100..12700, step 100; bit7=enable) -> EC 0x787
+/sys/bus/platform/devices/INOU0000:00/fan_tables      # 96 decimals: 48 CPU (up/down/duty*16) + 48 GPU -> EC 0xF00-0xF5F
+```
+
+`fan_sensitivity` mirrors the OEM `ADDR_TimAP_FanSwitchSpeedT100mSec`
+(0x787): each unit is 100 ms of settling between duty-curve steps, bit7
+enables it, `0` = disabled (OEM safe state). 300 ms = `echo 300 > fan_sensitivity`.
+
+`fan_tables` write format: `up down duty` repeated 16 times for the CPU table,
+then 16 times for the GPU table (duty is the raw register value, 0..200 =
+percent*2; the driver handles the EC layout: UpT[15]=0xFF sentinel, DownT
+shifted by one). The driver clears the region with the table control bit off,
+writes both tables and re-enables the control bit. Note the last three bytes
+of the GPU duty window (0xF5D-0xF5F) are the OEM `RamFan1p5` status/control
+registers, not duty slots — keep them 0. Quick tests:
+
+```sh
+# fan at 100% (temp >= 30°C): 16x(30 20 200) CPU + 16x(30 20 200) GPU
+python3 -c "print(' '.join(['30 20 200']*32))" | sudo tee /sys/bus/platform/devices/INOU0000:00/fan_tables
+# fan off (0%)：
+python3 -c "print(' '.join(['30 20 0']*32))" | sudo tee /sys/bus/platform/devices/INOU0000:00/fan_tables
 ```
 
 Performance hotkey (WMI event `0xB0`, the physical key next to the power button):

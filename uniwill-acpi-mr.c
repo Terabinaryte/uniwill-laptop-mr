@@ -16,6 +16,7 @@
 #include <linux/bits.h>
 #include <linux/bitfield.h>
 #include <linux/cleanup.h>
+#include <linux/ctype.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/device.h>
@@ -241,6 +242,15 @@
 #define EC_ADDR_FAN_DEFAULT		0x0786
 #define FAN_CURVE_LENGTH		5
 
+/* RamFan1p5: fan switching speed / sensitivity
+ * (ADDR_TimAP_FanSwitchSpeedT100mSec in the OEM ECSpec, 0x787):
+ * low 7 bits = step interval n x 100 ms (n = 1..127), bit7 = enable;
+ * 0x00 = disabled (safe state). Same bit7-enable design as EC_ADDR_FAN_DEFAULT.
+ * Measured 2026-08: 300 ms -> 0x83 is honored by the EC. */
+#define EC_ADDR_FAN_SWITCH_SPEED		0x0787
+#define FAN_SWITCH_SPEED_ENABLE			BIT(7)
+#define FAN_SWITCH_SPEED_MASK			GENMASK(6, 0)
+
 #define EC_ADDR_KBD_STATUS		0x078C
 #define KBD_WHITE_ONLY			BIT(0)	// ~single color
 #define KBD_SINGLE_COLOR_OFF		BIT(1)
@@ -308,6 +318,14 @@
 #define EC_ADDR_GPU_TEMP_START_TABLE	0x0F40
 
 #define EC_ADDR_GPU_FAN_SPEED_TABLE	0x0F50
+
+/* RamFan1p5 table status/control tail: the last three bytes of the GPU duty
+ * window (0xF50-0xF5F) are NOT duty slots. OEM RefreshDefaultFanTable writes
+ * 0xF5D=0xFD + 0xF5E=0xC9 (+0xF5F) to make the EC reload the factory table
+ * back into 0xF00-0xF5C. Do not clobber them with GPU duty values. */
+#define EC_ADDR_RAMFAN1P5_TABLE_STATUS1	0x0F5D
+#define EC_ADDR_RAMFAN1P5_TABLE_STATUS2	0x0F5E
+#define EC_ADDR_RAMFAN1P5_TABLE_CTRL	0x0F5F
 
 /*
  * Those two registers technically allow for manual fan control,
@@ -546,6 +564,13 @@ static const struct regmap_bus uniwill_ec_bus = {
 	.val_format_endian_default = REGMAP_ENDIAN_LITTLE,
 };
 
+/* MR fork: custom-mode fan tables span 0xF00-0xF5F (six 16-byte regions). */
+static bool uniwill_in_fan_table_range(unsigned int reg)
+{
+	return reg >= EC_ADDR_CPU_TEMP_END_TABLE &&
+	       reg <= (EC_ADDR_GPU_FAN_SPEED_TABLE + 0x0F);
+}
+
 static bool uniwill_writeable_reg(struct device *dev, unsigned int reg)
 {
 	switch (reg) {
@@ -575,11 +600,12 @@ static bool uniwill_writeable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_PL2_SETTING:
 	case EC_ADDR_PL4_SETTING:
 	case EC_ADDR_FAN_DEFAULT:
+	case EC_ADDR_FAN_SWITCH_SPEED:
 	case EC_ADDR_VRM_SPL:
 	case EC_ADDR_VRM_SPPT:
 		return true;
 	default:
-		return false;
+		return uniwill_in_fan_table_range(reg);
 	}
 }
 
@@ -624,11 +650,12 @@ static bool uniwill_readable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_PL2_SETTING:
 	case EC_ADDR_PL4_SETTING:
 	case EC_ADDR_FAN_DEFAULT:
+	case EC_ADDR_FAN_SWITCH_SPEED:
 	case EC_ADDR_VRM_SPL:
 	case EC_ADDR_VRM_SPPT:
 		return true;
 	default:
-		return false;
+		return uniwill_in_fan_table_range(reg);
 	}
 }
 
@@ -656,11 +683,12 @@ static bool uniwill_volatile_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_PL2_SETTING:
 	case EC_ADDR_PL4_SETTING:
 	case EC_ADDR_FAN_DEFAULT:
+	case EC_ADDR_FAN_SWITCH_SPEED:
 	case EC_ADDR_VRM_SPL:
 	case EC_ADDR_VRM_SPPT:
 		return true;
 	default:
-		return false;
+		return uniwill_in_fan_table_range(reg);
 	}
 }
 
@@ -1311,6 +1339,164 @@ static ssize_t tcc_offset_store(struct device *dev, struct device_attribute *att
 }
 static DEVICE_ATTR_RW(tcc_offset);
 
+/* MR fork: fan switching speed / sensitivity (0x787). Each unit is 100 ms of
+ * settling between steps of the fan duty curve; bit7 enables the smoothing.
+ * Writing 0 disables it (OEM safe state). Mirrors the TCC register layout. */
+static ssize_t fan_sensitivity_show(struct device *dev, struct device_attribute *attr,
+				    char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int value;
+	int ret;
+
+	ret = regmap_read(data->regmap, EC_ADDR_FAN_SWITCH_SPEED, &value);
+	if (ret < 0)
+		return ret;
+
+	if (!(value & FAN_SWITCH_SPEED_ENABLE))
+		return sysfs_emit(buf, "off\n");
+
+	return sysfs_emit(buf, "%u\n", (value & FAN_SWITCH_SPEED_MASK) * 100);
+}
+
+static ssize_t fan_sensitivity_store(struct device *dev, struct device_attribute *attr,
+				     const char *buf, size_t count)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int ms;
+	int ret;
+
+	ret = kstrtouint(buf, 10, &ms);
+	if (ret < 0)
+		return ret;
+	if (ms == 0)
+		return regmap_write(data->regmap, EC_ADDR_FAN_SWITCH_SPEED, 0);
+	if (ms % 100 || ms / 100 > FAN_SWITCH_SPEED_MASK)
+		return -EINVAL;
+
+	return regmap_write(data->regmap, EC_ADDR_FAN_SWITCH_SPEED,
+			    (ms / 100) | FAN_SWITCH_SPEED_ENABLE);
+}
+static DEVICE_ATTR_RW(fan_sensitivity);
+
+/* MR fork: custom-mode fan tables (measured 2026-08, REPORT 4.6.1).
+ *
+ * Layout (same as the OEM FanTable_Manager1p5, GCUCLI "custom" command):
+ *   CPU: 0xF00 UpT[0..15] (UpT[15]=0xFF sentinel), 0xF10 DownT[1..15]
+ *        (shifted: DownT[i+1] = point i), 0xF20 Duty[0..15] (0..200 = %*2)
+ *   GPU: 0xF30 / 0xF40 / 0xF50, same layout
+ * Write format: 96 decimal numbers (0..255), whitespace separated: the first
+ * 48 = CPU points repeated as up/down/duty*16, the last 48 = GPU points.
+ * 0x7C6 bit2 (table control) is cleared first, then the whole 0xF00-0xF5F
+ * region is zeroed, then the tables are written and the control bit is set
+ * again. */
+static int uniwill_parse_u8_list(const char *buf, u8 *out, size_t expect)
+{
+	size_t n = 0;
+	const char *p = buf;
+
+	while (n < expect) {
+		char *endp;
+		unsigned long v;
+
+		while (isspace(*p))
+			p++;
+		if (!*p)
+			break;
+		v = simple_strtoul(p, &endp, 10);
+		if (endp == p || v > U8_MAX)
+			return -EINVAL;
+		out[n++] = v;
+		p = endp;
+	}
+
+	return n == expect ? 0 : -EINVAL;
+}
+
+static int uniwill_write_fan_table(struct uniwill_data *data, const u8 *tbl, bool cpu)
+{
+	unsigned int base_up = cpu ? EC_ADDR_CPU_TEMP_END_TABLE   : EC_ADDR_GPU_TEMP_END_TABLE;
+	unsigned int base_dn = cpu ? EC_ADDR_CPU_TEMP_START_TABLE : EC_ADDR_GPU_TEMP_START_TABLE;
+	unsigned int base_du = cpu ? EC_ADDR_CPU_FAN_SPEED_TABLE  : EC_ADDR_GPU_FAN_SPEED_TABLE;
+	int i, ret;
+
+	for (i = 0; i < 16; i++) {
+		ret = regmap_write(data->regmap, base_up + i, i < 15 ? tbl[(i + 1) * 3] : 0xFF);
+		if (ret < 0)
+			return ret;
+	}
+	for (i = 0; i < 15; i++) {
+		ret = regmap_write(data->regmap, base_dn + 1 + i, tbl[i * 3 + 1]);
+		if (ret < 0)
+			return ret;
+	}
+	for (i = 0; i < 16; i++) {
+		ret = regmap_write(data->regmap, base_du + i, tbl[i * 3 + 2]);
+		if (ret < 0)
+			return ret;
+	}
+
+	return 0;
+}
+
+static ssize_t fan_tables_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	char *p = buf;
+	char *end = buf + PAGE_SIZE;
+	unsigned int value;
+	int ret, i;
+
+	for (i = 0; i < 0x60; i++) {
+		ret = regmap_read(data->regmap, EC_ADDR_CPU_TEMP_END_TABLE + i, &value);
+		if (ret < 0)
+			return ret;
+		if (p >= end - 8)
+			return -E2BIG;
+		p += scnprintf(p, end - p, "%u ", value);
+	}
+
+	return p - buf;
+}
+
+static ssize_t fan_tables_store(struct device *dev, struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	u8 values[96];
+	int ret, i;
+
+	ret = uniwill_parse_u8_list(buf, values, ARRAY_SIZE(values));
+	if (ret < 0)
+		return ret;
+
+	/* Disable table control, clear the whole region, write both tables,
+	 * re-enable table control (same order as the OEM service). */
+	ret = regmap_clear_bits(data->regmap, EC_ADDR_AP_OEM_6, ENABLE_UNIVERSAL_FAN_CTRL);
+	if (ret < 0)
+		return ret;
+
+	for (i = 0; i < 0x60; i++) {
+		ret = regmap_write(data->regmap, EC_ADDR_CPU_TEMP_END_TABLE + i, 0);
+		if (ret < 0)
+			return ret;
+	}
+
+	ret = uniwill_write_fan_table(data, values, true);
+	if (ret < 0)
+		return ret;
+	ret = uniwill_write_fan_table(data, values + 48, false);
+	if (ret < 0)
+		return ret;
+
+	ret = regmap_set_bits(data->regmap, EC_ADDR_AP_OEM_6, ENABLE_UNIVERSAL_FAN_CTRL);
+	if (ret < 0)
+		return ret;
+
+	return count;
+}
+static DEVICE_ATTR_RW(fan_tables);
+
 static struct attribute *uniwill_attrs[] = {
 	/* Keyboard-related */
 	&dev_attr_fn_lock_toggle_enable.attr,
@@ -1325,6 +1511,8 @@ static struct attribute *uniwill_attrs[] = {
 	&dev_attr_silent_boost.attr,
 	&dev_attr_power_limits.attr,
 	&dev_attr_tcc_offset.attr,
+	&dev_attr_fan_sensitivity.attr,
+	&dev_attr_fan_tables.attr,
 	NULL
 };
 
@@ -1365,7 +1553,8 @@ static umode_t uniwill_attr_is_visible(struct kobject *kobj, struct attribute *a
 	}
 
 	if (attr == &dev_attr_power_limits.attr ||
-	    attr == &dev_attr_tcc_offset.attr) {
+	    attr == &dev_attr_tcc_offset.attr ||
+	    attr == &dev_attr_fan_tables.attr) {
 		if (uniwill_device_supports(data, UNIWILL_FEATURE_PLATFORM_PROFILE))
 			return attr->mode;
 	}
@@ -2172,8 +2361,9 @@ static struct uniwill_device_descriptor tux_featureset_1_descriptor __initdata =
 static struct uniwill_device_descriptor empty_descriptor __initdata = {};
 
 /* MR fork: 机械革命 (Uniwill ODM) 默认 descriptor —— 最小功能集。
-   hwmon/电池不依赖 features；平台性能模式 + 静音狂暴为本分支核心新增；
-   FN_LOCK/TOUCHPAD/LIGHTBAR 等按实机验证后逐步开启。 */
+   hwmon/电池不依赖 features；平台性能模式 + 静音狂暴为本分支核心；
+   触摸板禁用不在此列：EC 0x7A6 位不影响 Linux I2C-HID 触摸板设备，
+   禁用请走桌面机制（GNOME send-events / xinput，详见 README）。 */
 static struct uniwill_device_descriptor mechrevo_descriptor __initdata = {
 	.features = UNIWILL_FEATURE_HWMON | UNIWILL_FEATURE_BATTERY |
 		    UNIWILL_FEATURE_PLATFORM_PROFILE | UNIWILL_FEATURE_SILENT_TURBO,
