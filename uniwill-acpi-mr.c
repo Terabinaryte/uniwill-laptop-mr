@@ -1098,19 +1098,32 @@ static ssize_t ctgp_offset_show(struct device *dev, struct device_attribute *att
 
 static DEVICE_ATTR_RW(ctgp_offset);
 
-/* MR fork: dGPU / MSHybrid mode (REPORT 4.8.1, DSDT \_SB.INOU AML):
+/* MR fork: dGPU / MSHybrid mode (REPORT 4.8.1, DSDT AML — note the methods
+ * live under \_SB.PCI0.SBRG.EC0, NOT \_SB.INOU):
  *   DGPS() -> 0x55 = dGPU direct (iGPU off), 0xAA = MSHybrid
  *   IGPS(1) -> switch to dGPU direct; IGPS(0) -> switch to MSHybrid
  * Runtime switch only; the NVRAM OemDisplayMode (efivarfs) persists the
  * choice across reboots. */
+static acpi_handle uniwill_ec0_handle(void)
+{
+	acpi_handle handle = NULL;
+
+	if (ACPI_FAILURE(acpi_get_handle(NULL, "\\_SB.PCI0.SBRG.EC0", &handle)))
+		return NULL;
+	return handle;
+}
+
 static ssize_t gpu_mode_show(struct device *dev, struct device_attribute *attr,
 			     char *buf)
 {
-	struct uniwill_data *data = dev_get_drvdata(dev);
+	acpi_handle ec0 = uniwill_ec0_handle();
 	unsigned long long output;
 	acpi_status status;
 
-	status = acpi_evaluate_integer(data->handle, "DGPS", NULL, &output);
+	if (!ec0)
+		return -ENODEV;
+
+	status = acpi_evaluate_integer(ec0, "DGPS", NULL, &output);
 	if (ACPI_FAILURE(status))
 		return -EIO;
 
@@ -1124,7 +1137,7 @@ static ssize_t gpu_mode_show(struct device *dev, struct device_attribute *attr,
 static ssize_t gpu_mode_store(struct device *dev, struct device_attribute *attr,
 			      const char *buf, size_t count)
 {
-	struct uniwill_data *data = dev_get_drvdata(dev);
+	acpi_handle ec0 = uniwill_ec0_handle();
 	union acpi_object param = {
 		.integer = {
 			.type = ACPI_TYPE_INTEGER,
@@ -1137,6 +1150,9 @@ static ssize_t gpu_mode_store(struct device *dev, struct device_attribute *attr,
 	};
 	acpi_status status;
 
+	if (!ec0)
+		return -ENODEV;
+
 	if (sysfs_streq(buf, "dgpu") || sysfs_streq(buf, "1"))
 		param.integer.value = 1;
 	else if (sysfs_streq(buf, "mshybrid") || sysfs_streq(buf, "0"))
@@ -1144,7 +1160,7 @@ static ssize_t gpu_mode_store(struct device *dev, struct device_attribute *attr,
 	else
 		return -EINVAL;
 
-	status = acpi_evaluate_object(data->handle, "IGPS", &input, NULL);
+	status = acpi_evaluate_object(ec0, "IGPS", &input, NULL);
 	if (ACPI_FAILURE(status))
 		return -EIO;
 
