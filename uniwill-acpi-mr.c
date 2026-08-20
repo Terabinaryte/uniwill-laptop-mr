@@ -169,6 +169,14 @@
 #define EC_ADDR_AP_CUSTOM_LIGHT		0x0727
 #define AP_CUSTOM_LIGHT_ENABLE		BIT(6)
 
+/* MR fork: custom-mode master switch (SetCustomModetoEC, JIT-decoded IL).
+ * Whole-byte write: 0x41 enables custom mode, 0x40 disables (0x40 base +
+ * bit0 = custom on). Used together with the 0x726/0x727 flags and the
+ * fan tables; without it the EC ignores the RamFan1p5 tables. */
+#define EC_ADDR_AP_BIOS_CONTROL		0x0706
+#define AP_BIOS_CUSTOM_MODE_ON		0x41
+#define AP_BIOS_CUSTOM_MODE_OFF		0x40
+
 /* MR fork: VRM current limits (SetCpuVrmCurrentLimit): written once when
  * PL1 >= 75 W, NOT reverted when leaving custom mode (measured 2026-08). */
 #define EC_ADDR_VRM_SPL			0x0753
@@ -287,6 +295,12 @@
 #define CHARGE_CTRL_MASK		GENMASK(6, 0)
 #define CHARGE_CTRL_REACHED		BIT(7)
 
+/* MR fork: fan independent control (SetEcFanControlRespective, JIT-decoded IL):
+ * bit7 = separate CPU/GPU fan tables ("FanControlRespective" in the table
+ * JSON). Missing bit => the EC ignores the RamFan1p5 tables entirely
+ * (measured 2026-08: with 0x7C6 + 96 table bytes but no 0x7C5 bit7 the fan
+ * does not follow the table; setting 0x7C5 bit7 makes it work immediately).
+ * Write sequence: read-modify-write, preserve low 7 bits. */
 #define EC_ADDR_UNIVERSAL_FAN_CTRL	0x07C5
 #define SPLIT_TABLES			BIT(7)
 
@@ -595,6 +609,8 @@ static bool uniwill_writeable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_SILENT_TURBO:
 	case EC_ADDR_EC_CUSTOM_FLAG:
 	case EC_ADDR_AP_CUSTOM_LIGHT:
+	case EC_ADDR_AP_BIOS_CONTROL:
+	case EC_ADDR_UNIVERSAL_FAN_CTRL:
 	case EC_ADDR_AP_OEM_6:
 	case EC_ADDR_PL1_SETTING:
 	case EC_ADDR_PL2_SETTING:
@@ -645,6 +661,8 @@ static bool uniwill_readable_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_SILENT_TURBO:
 	case EC_ADDR_EC_CUSTOM_FLAG:
 	case EC_ADDR_AP_CUSTOM_LIGHT:
+	case EC_ADDR_AP_BIOS_CONTROL:
+	case EC_ADDR_UNIVERSAL_FAN_CTRL:
 	case EC_ADDR_AP_OEM_6:
 	case EC_ADDR_PL1_SETTING:
 	case EC_ADDR_PL2_SETTING:
@@ -678,6 +696,8 @@ static bool uniwill_volatile_reg(struct device *dev, unsigned int reg)
 	case EC_ADDR_SILENT_TURBO:
 	case EC_ADDR_EC_CUSTOM_FLAG:
 	case EC_ADDR_AP_CUSTOM_LIGHT:
+	case EC_ADDR_AP_BIOS_CONTROL:
+	case EC_ADDR_UNIVERSAL_FAN_CTRL:
 	case EC_ADDR_AP_OEM_6:
 	case EC_ADDR_PL1_SETTING:
 	case EC_ADDR_PL2_SETTING:
@@ -1097,10 +1117,18 @@ static int uniwill_profile_set(struct device *dev, enum platform_profile_option 
 		value = FAN_MODE_TURBO;			/* 0x10 */
 		break;
 	case PLATFORM_PROFILE_CUSTOM:
-		/* MR fork: custom mode = EC flag (0x726 bit7) + light (0x727 bit6)
-		 * + fan-table control (0x7C6 bit2) (measured 2026-08, REPORT 4.6.1).
+		/* MR fork: custom mode = master switch (0x706=0x41) + EC flag
+		 * (0x726 bit7) + light (0x727 bit6) + independent fan control
+		 * (0x7C5 bit7) + fan-table control (0x7C6 bit2) (measured 2026-08,
+		 * REPORT 4.6.1; SetCustomModetoEC/SetEcFanControlRespective IL).
 		 * The fan tables themselves are written by the userspace daemon;
 		 * 0x751 keeps its current value. */
+		ret = regmap_write(data->regmap, EC_ADDR_AP_BIOS_CONTROL, AP_BIOS_CUSTOM_MODE_ON);
+		if (ret < 0)
+			return ret;
+		ret = regmap_set_bits(data->regmap, EC_ADDR_UNIVERSAL_FAN_CTRL, SPLIT_TABLES);
+		if (ret < 0)
+			return ret;
 		ret = regmap_set_bits(data->regmap, EC_ADDR_EC_CUSTOM_FLAG, EC_CUSTOM_MODE_ENABLE);
 		if (ret < 0)
 			return ret;
@@ -1112,8 +1140,9 @@ static int uniwill_profile_set(struct device *dev, enum platform_profile_option 
 		return -EOPNOTSUPP;
 	}
 
-	/* Leaving custom mode (0x726 bit7 set): clear the flag, the light and
-	 * the fan-table control before touching the 0x751 mode byte. */
+	/* Leaving custom mode (0x726 bit7 set): clear the flag, the light,
+	 * the independent fan control, the fan-table control and the master
+	 * switch before touching the 0x751 mode byte. */
 	ret = regmap_read(data->regmap, EC_ADDR_EC_CUSTOM_FLAG, &cur);
 	if (ret == 0 && (cur & EC_CUSTOM_MODE_ENABLE)) {
 		ret = regmap_clear_bits(data->regmap, EC_ADDR_EC_CUSTOM_FLAG, EC_CUSTOM_MODE_ENABLE);
@@ -1122,7 +1151,13 @@ static int uniwill_profile_set(struct device *dev, enum platform_profile_option 
 		ret = regmap_clear_bits(data->regmap, EC_ADDR_AP_CUSTOM_LIGHT, AP_CUSTOM_LIGHT_ENABLE);
 		if (ret < 0)
 			return ret;
+		ret = regmap_clear_bits(data->regmap, EC_ADDR_UNIVERSAL_FAN_CTRL, SPLIT_TABLES);
+		if (ret < 0)
+			return ret;
 		ret = regmap_clear_bits(data->regmap, EC_ADDR_AP_OEM_6, ENABLE_UNIVERSAL_FAN_CTRL);
+		if (ret < 0)
+			return ret;
+		ret = regmap_write(data->regmap, EC_ADDR_AP_BIOS_CONTROL, AP_BIOS_CUSTOM_MODE_OFF);
 		if (ret < 0)
 			return ret;
 	}
@@ -1472,8 +1507,17 @@ static ssize_t fan_tables_store(struct device *dev, struct device_attribute *att
 	if (ret < 0)
 		return ret;
 
-	/* Disable table control, clear the whole region, write both tables,
-	 * re-enable table control (same order as the OEM service). */
+	/* Full write sequence (same as the OEM SetFanTable, REPORT 4.6.1):
+	 * 1. enable independent CPU/GPU fan control (0x7C5 bit7) — without it
+	 *    the EC ignores the tables entirely;
+	 * 2. disable table control (0x7C6 bit2);
+	 * 3. zero the whole 0xF00-0xF5F region;
+	 * 4. write both tables;
+	 * 5. re-enable table control. */
+	ret = regmap_set_bits(data->regmap, EC_ADDR_UNIVERSAL_FAN_CTRL, SPLIT_TABLES);
+	if (ret < 0)
+		return ret;
+
 	ret = regmap_clear_bits(data->regmap, EC_ADDR_AP_OEM_6, ENABLE_UNIVERSAL_FAN_CTRL);
 	if (ret < 0)
 		return ret;
@@ -2086,11 +2130,19 @@ static int uniwill_ec_init(struct uniwill_data *data)
 	 * confuse power-profiles-daemon. The daemon re-applies the fan tables
 	 * and re-enables custom mode later. Power limits (0x783-785) are cleared
 	 * like the OEM service does when leaving custom mode; VRM limits are
-	 * intentionally NOT touched (measured: they survive, 0x753=65/0x754=120). */
+	 * intentionally NOT touched (measured: they survive, 0x753=65/0x754=120).
+	 * The custom master switch (0x706) and the independent fan control
+	 * (0x7C5 bit7) are cleared too, matching the OEM leave-custom sequence. */
+	ret = regmap_write(data->regmap, EC_ADDR_AP_BIOS_CONTROL, AP_BIOS_CUSTOM_MODE_OFF);
+	if (ret < 0)
+		return ret;
 	ret = regmap_clear_bits(data->regmap, EC_ADDR_EC_CUSTOM_FLAG, EC_CUSTOM_MODE_ENABLE);
 	if (ret < 0)
 		return ret;
 	ret = regmap_clear_bits(data->regmap, EC_ADDR_AP_CUSTOM_LIGHT, AP_CUSTOM_LIGHT_ENABLE);
+	if (ret < 0)
+		return ret;
+	ret = regmap_clear_bits(data->regmap, EC_ADDR_UNIVERSAL_FAN_CTRL, SPLIT_TABLES);
 	if (ret < 0)
 		return ret;
 	ret = regmap_clear_bits(data->regmap, EC_ADDR_AP_OEM_6, ENABLE_UNIVERSAL_FAN_CTRL);
