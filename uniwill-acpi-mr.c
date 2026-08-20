@@ -1219,11 +1219,27 @@ static int uniwill_profile_get(struct device *dev, enum platform_profile_option 
  * (0x726 bit7) + light (0x727 bit6) + independent fan control (0x7C5 bit7)
  * + fan-table control (0x7C6 bit2) (measured 2026-08, REPORT 4.6.1;
  * SetCustomModetoEC/SetEcFanControlRespective IL). Then apply the built-in
- * safe defaults until the userspace daemon overwrites them. */
+ * safe defaults until the userspace daemon overwrites them.
+ *
+ * Order matters for the mode LED: the 0x751 mode byte must be set to the
+ * custom base value (0x00, same as balanced) *before* the custom light bit
+ * (0x727 bit6) is raised, otherwise the LED briefly shows the previous
+ * mode's color (REPORT 4.6.1: custom mode keeps 0x751 at its base 0x00;
+ * Windows ApplyEcFanTable.cs writes 0x751 first, then the flags). */
 static int uniwill_custom_apply_defaults(struct uniwill_data *data);
 static int uniwill_custom_enter(struct uniwill_data *data)
 {
+	unsigned int cur;
 	int ret;
+
+	/* Custom base value: 0x00, preserving the independent FanBoost bit
+	 * (0x40) — same as the OEM service (REPORT 4.6.1, ApplyEcFanTable.cs). */
+	ret = regmap_read(data->regmap, EC_ADDR_MANUAL_FAN_CTRL, &cur);
+	if (ret < 0)
+		return ret;
+	ret = regmap_write(data->regmap, EC_ADDR_MANUAL_FAN_CTRL, cur & FAN_MODE_BOOST);
+	if (ret < 0)
+		return ret;
 
 	ret = regmap_write(data->regmap, EC_ADDR_AP_BIOS_CONTROL, AP_BIOS_CUSTOM_MODE_ON);
 	if (ret < 0)
@@ -1297,15 +1313,11 @@ static int uniwill_profile_set(struct device *dev, enum platform_profile_option 
 		return -EOPNOTSUPP;
 	}
 
-	/* Leaving custom mode (0x726 bit7 set): clear the flag, the light,
-	 * the independent fan control, the fan-table control and the master
-	 * switch before touching the 0x751 mode byte. */
-	ret = regmap_read(data->regmap, EC_ADDR_EC_CUSTOM_FLAG, &cur);
-	if (ret == 0 && (cur & EC_CUSTOM_MODE_ENABLE))
-		ret = uniwill_custom_leave(data);
-	if (ret < 0)
-		return ret;
-
+	/* Leaving custom mode: switch the 0x751 mode byte to the new profile
+	 * *before* clearing the custom light bit (0x727 bit6). Clearing the
+	 * light first would briefly show the previous mode's LED color, because
+	 * custom mode keeps 0x751 at the balanced base 0x00 (REPORT 4.6.1,
+	 * user-observed flicker 2026-08). */
 	/* Preserve the FanBoost bit (0x40): it is managed independently and must
 	 * survive profile switches (measured 2026-08, REPORT 4.6.1). */
 	ret = regmap_read(data->regmap, EC_ADDR_MANUAL_FAN_CTRL, &cur);
@@ -1313,7 +1325,19 @@ static int uniwill_profile_set(struct device *dev, enum platform_profile_option 
 		return ret;
 	value |= cur & FAN_MODE_BOOST;
 
-	return regmap_write(data->regmap, EC_ADDR_MANUAL_FAN_CTRL, value);
+	ret = regmap_write(data->regmap, EC_ADDR_MANUAL_FAN_CTRL, value);
+	if (ret < 0)
+		return ret;
+
+	/* Now leave custom mode (clears the flag, the light, the independent
+	 * fan control, the table control and the master switch). */
+	ret = regmap_read(data->regmap, EC_ADDR_EC_CUSTOM_FLAG, &cur);
+	if (ret == 0 && (cur & EC_CUSTOM_MODE_ENABLE))
+		ret = uniwill_custom_leave(data);
+	if (ret < 0)
+		return ret;
+
+	return 0;
 }
 
 static void uniwill_profile_cycle(struct uniwill_data *data)
@@ -1348,14 +1372,19 @@ static void uniwill_profile_cycle(struct uniwill_data *data)
 			break;
 		}
 	} else {
+		/* Without custom mode in the cycle, the key still cycles
+		 * 办公(0)->均衡(1)->狂暴(2)->办公(0). Custom mode is encoded as
+		 * 3 (REPORT 4.6.1: PowerMode 0=办公 1=均衡 2=狂暴 3=自定义,
+		 * cycle = (mode+1)%4), so pressing from custom mode wraps to
+		 * quiet (3->0) exactly like the OEM key behavior. */
 		switch (cur) {
 		case PLATFORM_PROFILE_QUIET:
 			next = PLATFORM_PROFILE_BALANCED;
 			break;
 		case PLATFORM_PROFILE_BALANCED:
-		case PLATFORM_PROFILE_CUSTOM:
 			next = PLATFORM_PROFILE_PERFORMANCE;
 			break;
+		case PLATFORM_PROFILE_CUSTOM:
 		default: /* PERFORMANCE */
 			next = PLATFORM_PROFILE_QUIET;
 			break;
