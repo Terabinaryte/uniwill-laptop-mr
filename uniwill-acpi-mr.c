@@ -1545,7 +1545,12 @@ static ssize_t tcc_offset_store(struct device *dev, struct device_attribute *att
 	if (target > 0x7F)
 		return -ERANGE;
 
-	return regmap_write(data->regmap, EC_ADDR_FAN_DEFAULT, target ? (target | 0x80) : 0);
+	/* Must return count, not the regmap result (0) — kernfs treats a short
+	 * write as "failed to write whole buffer" and echo/tee hang. */
+	ret = regmap_write(data->regmap, EC_ADDR_FAN_DEFAULT, target ? (target | 0x80) : 0);
+	if (ret < 0)
+		return ret;
+	return count;
 }
 static DEVICE_ATTR_RW(tcc_offset);
 
@@ -1581,13 +1586,20 @@ static ssize_t fan_sensitivity_store(struct device *dev, struct device_attribute
 	ret = kstrtouint(buf, 10, &ms);
 	if (ret < 0)
 		return ret;
-	if (ms == 0)
-		return regmap_write(data->regmap, EC_ADDR_FAN_SWITCH_SPEED, 0);
+	if (ms == 0) {
+		ret = regmap_write(data->regmap, EC_ADDR_FAN_SWITCH_SPEED, 0);
+		if (ret < 0)
+			return ret;
+		return count;
+	}
 	if (ms % 100 || ms / 100 > FAN_SWITCH_SPEED_MASK)
 		return -EINVAL;
 
-	return regmap_write(data->regmap, EC_ADDR_FAN_SWITCH_SPEED,
-			    (u8)(ms / 100) | FAN_SWITCH_SPEED_ENABLE);
+	ret = regmap_write(data->regmap, EC_ADDR_FAN_SWITCH_SPEED,
+			   (u8)(ms / 100) | FAN_SWITCH_SPEED_ENABLE);
+	if (ret < 0)
+		return ret;
+	return count;
 }
 static DEVICE_ATTR_RW(fan_sensitivity);
 
@@ -1850,12 +1862,22 @@ static ssize_t custom_mode_store(struct device *dev, struct device_attribute *at
 	if (ret < 0)
 		return ret;
 
-	if (enable)
-		return uniwill_custom_enter(data);
+	/* NB: must return count (bytes written), not the helper's 0 — kernfs
+	 * treats a short return as "failed to write whole buffer" and echo/tee
+	 * then hang waiting for the rest. */
+	if (enable) {
+		ret = uniwill_custom_enter(data);
+		if (ret < 0)
+			return ret;
+		return count;
+	}
 
 	/* Leave custom mode: clear everything, restore the AP BIOS control
 	 * byte, let the EC fall back to its own fan control. */
-	return uniwill_custom_leave(data);
+	ret = uniwill_custom_leave(data);
+	if (ret < 0)
+		return ret;
+	return count;
 }
 static DEVICE_ATTR_RW(custom_mode);
 
