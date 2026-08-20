@@ -394,6 +394,11 @@ struct uniwill_data {
 	struct input_dev *input_device;
 	struct device *profile_dev;	/* platform profile class device (MR fork) */
 	struct notifier_block nb;
+	/* MR fork: have the userspace daemon written power limits / fan tables
+	 * since the last probe? Until it does, entering custom mode applies the
+	 * built-in safe defaults (PL 75/85/85 W + a mild default fan curve). */
+	bool pl_written;
+	bool tables_written;
 };
 
 struct uniwill_battery_entry {
@@ -1094,6 +1099,57 @@ static int uniwill_profile_get(struct device *dev, enum platform_profile_option 
 	return 0;
 }
 
+/* MR fork: enter custom mode = master switch (0x706=0x41) + EC flag
+ * (0x726 bit7) + light (0x727 bit6) + independent fan control (0x7C5 bit7)
+ * + fan-table control (0x7C6 bit2) (measured 2026-08, REPORT 4.6.1;
+ * SetCustomModetoEC/SetEcFanControlRespective IL). Then apply the built-in
+ * safe defaults until the userspace daemon overwrites them. */
+static int uniwill_custom_apply_defaults(struct uniwill_data *data);
+static int uniwill_custom_enter(struct uniwill_data *data)
+{
+	int ret;
+
+	ret = regmap_write(data->regmap, EC_ADDR_AP_BIOS_CONTROL, AP_BIOS_CUSTOM_MODE_ON);
+	if (ret < 0)
+		return ret;
+	ret = regmap_set_bits(data->regmap, EC_ADDR_UNIVERSAL_FAN_CTRL, SPLIT_TABLES);
+	if (ret < 0)
+		return ret;
+	ret = regmap_set_bits(data->regmap, EC_ADDR_EC_CUSTOM_FLAG, EC_CUSTOM_MODE_ENABLE);
+	if (ret < 0)
+		return ret;
+	ret = regmap_set_bits(data->regmap, EC_ADDR_AP_CUSTOM_LIGHT, AP_CUSTOM_LIGHT_ENABLE);
+	if (ret < 0)
+		return ret;
+	ret = regmap_set_bits(data->regmap, EC_ADDR_AP_OEM_6, ENABLE_UNIVERSAL_FAN_CTRL);
+	if (ret < 0)
+		return ret;
+
+	return uniwill_custom_apply_defaults(data);
+}
+
+/* MR fork: leave custom mode = clear the flag, the light, the independent
+ * fan control, the fan-table control and the master switch (0x706=0x40). */
+static int uniwill_custom_leave(struct uniwill_data *data)
+{
+	int ret;
+
+	ret = regmap_clear_bits(data->regmap, EC_ADDR_EC_CUSTOM_FLAG, EC_CUSTOM_MODE_ENABLE);
+	if (ret < 0)
+		return ret;
+	ret = regmap_clear_bits(data->regmap, EC_ADDR_AP_CUSTOM_LIGHT, AP_CUSTOM_LIGHT_ENABLE);
+	if (ret < 0)
+		return ret;
+	ret = regmap_clear_bits(data->regmap, EC_ADDR_UNIVERSAL_FAN_CTRL, SPLIT_TABLES);
+	if (ret < 0)
+		return ret;
+	ret = regmap_clear_bits(data->regmap, EC_ADDR_AP_OEM_6, ENABLE_UNIVERSAL_FAN_CTRL);
+	if (ret < 0)
+		return ret;
+
+	return regmap_write(data->regmap, EC_ADDR_AP_BIOS_CONTROL, AP_BIOS_CUSTOM_MODE_OFF);
+}
+
 static int uniwill_profile_set(struct device *dev, enum platform_profile_option profile)
 {
 	struct uniwill_data *data = dev_get_drvdata(dev);
@@ -1117,25 +1173,10 @@ static int uniwill_profile_set(struct device *dev, enum platform_profile_option 
 		value = FAN_MODE_TURBO;			/* 0x10 */
 		break;
 	case PLATFORM_PROFILE_CUSTOM:
-		/* MR fork: custom mode = master switch (0x706=0x41) + EC flag
-		 * (0x726 bit7) + light (0x727 bit6) + independent fan control
-		 * (0x7C5 bit7) + fan-table control (0x7C6 bit2) (measured 2026-08,
-		 * REPORT 4.6.1; SetCustomModetoEC/SetEcFanControlRespective IL).
-		 * The fan tables themselves are written by the userspace daemon;
-		 * 0x751 keeps its current value. */
-		ret = regmap_write(data->regmap, EC_ADDR_AP_BIOS_CONTROL, AP_BIOS_CUSTOM_MODE_ON);
-		if (ret < 0)
-			return ret;
-		ret = regmap_set_bits(data->regmap, EC_ADDR_UNIVERSAL_FAN_CTRL, SPLIT_TABLES);
-		if (ret < 0)
-			return ret;
-		ret = regmap_set_bits(data->regmap, EC_ADDR_EC_CUSTOM_FLAG, EC_CUSTOM_MODE_ENABLE);
-		if (ret < 0)
-			return ret;
-		ret = regmap_set_bits(data->regmap, EC_ADDR_AP_CUSTOM_LIGHT, AP_CUSTOM_LIGHT_ENABLE);
-		if (ret < 0)
-			return ret;
-		return regmap_set_bits(data->regmap, EC_ADDR_AP_OEM_6, ENABLE_UNIVERSAL_FAN_CTRL);
+		/* MR fork: full custom chain (master switch, flags, independent
+		 * fan control, table control) + built-in defaults until the
+		 * userspace daemon writes its own values (REPORT 4.6.1). */
+		return uniwill_custom_enter(data);
 	default:
 		return -EOPNOTSUPP;
 	}
@@ -1144,23 +1185,10 @@ static int uniwill_profile_set(struct device *dev, enum platform_profile_option 
 	 * the independent fan control, the fan-table control and the master
 	 * switch before touching the 0x751 mode byte. */
 	ret = regmap_read(data->regmap, EC_ADDR_EC_CUSTOM_FLAG, &cur);
-	if (ret == 0 && (cur & EC_CUSTOM_MODE_ENABLE)) {
-		ret = regmap_clear_bits(data->regmap, EC_ADDR_EC_CUSTOM_FLAG, EC_CUSTOM_MODE_ENABLE);
-		if (ret < 0)
-			return ret;
-		ret = regmap_clear_bits(data->regmap, EC_ADDR_AP_CUSTOM_LIGHT, AP_CUSTOM_LIGHT_ENABLE);
-		if (ret < 0)
-			return ret;
-		ret = regmap_clear_bits(data->regmap, EC_ADDR_UNIVERSAL_FAN_CTRL, SPLIT_TABLES);
-		if (ret < 0)
-			return ret;
-		ret = regmap_clear_bits(data->regmap, EC_ADDR_AP_OEM_6, ENABLE_UNIVERSAL_FAN_CTRL);
-		if (ret < 0)
-			return ret;
-		ret = regmap_write(data->regmap, EC_ADDR_AP_BIOS_CONTROL, AP_BIOS_CUSTOM_MODE_OFF);
-		if (ret < 0)
-			return ret;
-	}
+	if (ret == 0 && (cur & EC_CUSTOM_MODE_ENABLE))
+		ret = uniwill_custom_leave(data);
+	if (ret < 0)
+		return ret;
 
 	/* Preserve the FanBoost bit (0x40): it is managed independently and must
 	 * survive profile switches (measured 2026-08, REPORT 4.6.1). */
@@ -1333,6 +1361,8 @@ static ssize_t power_limits_store(struct device *dev, struct device_attribute *a
 		if (ret < 0)
 			return ret;
 	}
+
+	data->pl_written = true;
 
 	return count;
 }
@@ -1539,15 +1569,158 @@ static ssize_t fan_tables_store(struct device *dev, struct device_attribute *att
 	if (ret < 0)
 		return ret;
 
+	data->tables_written = true;
+
 	return count;
 }
 static DEVICE_ATTR_RW(fan_tables);
+
+/* MR fork: built-in safe defaults for custom mode, applied when the
+ * userspace daemon has not written its own values yet (data->pl_written /
+ * data->tables_written). Interleaved (up, down, duty) x 16 per fan, CPU
+ * then GPU, same format as fan_tables_store (REPORT 4.6.1).
+ *
+ * Default curve: fan starts ramping at ~50 C and reaches 100 % at ~75 C;
+ * GPU tracks a few degrees lower. Duty is the raw register value (0-200,
+ * 100 % = 200). */
+static const u8 uniwill_default_fan_tables[96] = {
+	/* CPU: ID0..15 (up, down, duty) */
+	0,  46, 0,	/* ID0: no up slot (UpT starts at ID1) */
+	50, 48, 40,	/* ID1 */
+	54, 52, 80,	/* ID2 */
+	58, 56, 120,	/* ID3 */
+	62, 60, 160,	/* ID4 */
+	66, 64, 180,	/* ID5 */
+	70, 68, 200,	/* ID6 */
+	74, 72, 200,	/* ID7 */
+	78, 76, 200,	/* ID8 */
+	82, 80, 200,	/* ID9 */
+	86, 84, 200,	/* ID10 */
+	90, 88, 200,	/* ID11 */
+	95, 92, 200,	/* ID12 */
+	0xFF, 0xFF, 200, /* ID13 */
+	0xFF, 0xFF, 200, /* ID14 */
+	0xFF, 0xFF, 200, /* ID15 */
+	/* GPU */
+	0,  44, 0,	/* ID0 */
+	48, 46, 40,	/* ID1 */
+	52, 50, 80,	/* ID2 */
+	56, 54, 120,	/* ID3 */
+	60, 58, 160,	/* ID4 */
+	64, 62, 180,	/* ID5 */
+	68, 66, 200,	/* ID6 */
+	72, 70, 200,	/* ID7 */
+	76, 74, 200,	/* ID8 */
+	80, 78, 200,	/* ID9 */
+	84, 82, 200,	/* ID10 */
+	88, 86, 200,	/* ID11 */
+	92, 90, 200,	/* ID12 */
+	0xFF, 0xFF, 200, /* ID13 */
+	0xFF, 0xFF, 200, /* ID14 */
+	0xFF, 0xFF, 200, /* ID15 */
+};
+
+/* Apply the built-in safe defaults: power limits 75/85/85 W (+ VRM limits
+ * since PL1 >= 75, same rule as power_limits_store) and the default fan
+ * tables. Only used when the daemon has not written its own values. */
+static int uniwill_custom_apply_defaults(struct uniwill_data *data)
+{
+	int ret;
+
+	if (!data->pl_written) {
+		ret = regmap_write(data->regmap, EC_ADDR_PL1_SETTING, 75);
+		if (ret < 0)
+			return ret;
+		ret = regmap_write(data->regmap, EC_ADDR_PL2_SETTING, 85);
+		if (ret < 0)
+			return ret;
+		ret = regmap_write(data->regmap, EC_ADDR_PL4_SETTING, 85);
+		if (ret < 0)
+			return ret;
+		/* PL1 >= 75 W also raises the VRM current limits (REPORT 4.6.1). */
+		ret = regmap_write(data->regmap, EC_ADDR_VRM_SPL, 65);
+		if (ret < 0)
+			return ret;
+		ret = regmap_write(data->regmap, EC_ADDR_VRM_SPPT, 120);
+		if (ret < 0)
+			return ret;
+	}
+
+	if (!data->tables_written) {
+		/* Same write sequence as fan_tables_store: independent fan
+		 * control -> clear table control -> zero region -> write both
+		 * tables -> set table control. */
+		ret = regmap_set_bits(data->regmap, EC_ADDR_UNIVERSAL_FAN_CTRL, SPLIT_TABLES);
+		if (ret < 0)
+			return ret;
+		ret = regmap_clear_bits(data->regmap, EC_ADDR_AP_OEM_6, ENABLE_UNIVERSAL_FAN_CTRL);
+		if (ret < 0)
+			return ret;
+		for (int i = 0; i < 0x60; i++) {
+			ret = regmap_write(data->regmap, EC_ADDR_CPU_TEMP_END_TABLE + i, 0);
+			if (ret < 0)
+				return ret;
+		}
+		ret = uniwill_write_fan_table(data, uniwill_default_fan_tables, true);
+		if (ret < 0)
+			return ret;
+		ret = uniwill_write_fan_table(data, uniwill_default_fan_tables + 48, false);
+		if (ret < 0)
+			return ret;
+		ret = regmap_set_bits(data->regmap, EC_ADDR_AP_OEM_6, ENABLE_UNIVERSAL_FAN_CTRL);
+		if (ret < 0)
+			return ret;
+	}
+
+	return 0;
+}
+
+/* MR fork: custom-mode switch, on the same shelf as the super-key toggle.
+ * echo 1 > custom_mode enters the full custom chain (master switch, flags,
+ * independent fan control, table control) and applies the built-in defaults
+ * until the userspace daemon writes its own power limits / fan tables.
+ * echo 0 > custom_mode leaves custom mode and restores the normal fan
+ * behavior (REPORT 4.6.1). */
+static ssize_t custom_mode_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int value;
+	int ret;
+
+	ret = regmap_read(data->regmap, EC_ADDR_EC_CUSTOM_FLAG, &value);
+	if (ret < 0)
+		return ret;
+
+	return sysfs_emit(buf, "%d\n", !!(value & EC_CUSTOM_MODE_ENABLE));
+}
+
+static ssize_t custom_mode_store(struct device *dev, struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	bool enable;
+	int ret;
+
+	ret = kstrtobool(buf, &enable);
+	if (ret < 0)
+		return ret;
+
+	if (enable)
+		return uniwill_custom_enter(data);
+
+	/* Leave custom mode: clear everything, restore the AP BIOS control
+	 * byte, let the EC fall back to its own fan control. */
+	return uniwill_custom_leave(data);
+}
+static DEVICE_ATTR_RW(custom_mode);
 
 static struct attribute *uniwill_attrs[] = {
 	/* Keyboard-related */
 	&dev_attr_fn_lock_toggle_enable.attr,
 	&dev_attr_super_key_toggle_enable.attr,
 	&dev_attr_touchpad_toggle_enable.attr,
+	/* MR fork: custom-mode switch (same shelf as the super-key toggle) */
+	&dev_attr_custom_mode.attr,
 	/* Lightbar-related */
 	&dev_attr_rainbow_animation.attr,
 	&dev_attr_breathing_in_suspend.attr,
@@ -1601,7 +1774,8 @@ static umode_t uniwill_attr_is_visible(struct kobject *kobj, struct attribute *a
 	if (attr == &dev_attr_power_limits.attr ||
 	    attr == &dev_attr_tcc_offset.attr ||
 	    attr == &dev_attr_fan_sensitivity.attr ||
-	    attr == &dev_attr_fan_tables.attr) {
+	    attr == &dev_attr_fan_tables.attr ||
+	    attr == &dev_attr_custom_mode.attr) {
 		if (uniwill_device_supports(data, UNIWILL_FEATURE_PLATFORM_PROFILE))
 			return attr->mode;
 	}
