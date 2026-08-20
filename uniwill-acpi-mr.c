@@ -1098,75 +1098,12 @@ static ssize_t ctgp_offset_show(struct device *dev, struct device_attribute *att
 
 static DEVICE_ATTR_RW(ctgp_offset);
 
-/* MR fork: dGPU / MSHybrid mode (REPORT 4.8.1, DSDT AML — note the methods
- * live under \_SB.PCI0.SBRG.EC0, NOT \_SB.INOU):
- *   DGPS() -> 0x55 = dGPU direct (iGPU off), 0xAA = MSHybrid
- *   IGPS(1) -> switch to dGPU direct; IGPS(0) -> switch to MSHybrid
- * Runtime switch only; the NVRAM OemDisplayMode (efivarfs) persists the
- * choice across reboots. */
-static acpi_handle uniwill_ec0_handle(void)
-{
-	acpi_handle handle = NULL;
-
-	if (ACPI_FAILURE(acpi_get_handle(NULL, "\\_SB.PCI0.SBRG.EC0", &handle)))
-		return NULL;
-	return handle;
-}
-
-static ssize_t gpu_mode_show(struct device *dev, struct device_attribute *attr,
-			     char *buf)
-{
-	acpi_handle ec0 = uniwill_ec0_handle();
-	unsigned long long output;
-	acpi_status status;
-
-	if (!ec0)
-		return -ENODEV;
-
-	status = acpi_evaluate_integer(ec0, "DGPS", NULL, &output);
-	if (ACPI_FAILURE(status))
-		return -EIO;
-
-	if (output == 0x55)
-		return sysfs_emit(buf, "dgpu\n");
-	if (output == 0xAA)
-		return sysfs_emit(buf, "mshybrid\n");
-	return sysfs_emit(buf, "0x%02llx\n", output);
-}
-
-static ssize_t gpu_mode_store(struct device *dev, struct device_attribute *attr,
-			      const char *buf, size_t count)
-{
-	acpi_handle ec0 = uniwill_ec0_handle();
-	union acpi_object param = {
-		.integer = {
-			.type = ACPI_TYPE_INTEGER,
-			.value = 0,
-		},
-	};
-	struct acpi_object_list input = {
-		.count = 1,
-		.pointer = &param,
-	};
-	acpi_status status;
-
-	if (!ec0)
-		return -ENODEV;
-
-	if (sysfs_streq(buf, "dgpu") || sysfs_streq(buf, "1"))
-		param.integer.value = 1;
-	else if (sysfs_streq(buf, "mshybrid") || sysfs_streq(buf, "0"))
-		param.integer.value = 0;
-	else
-		return -EINVAL;
-
-	status = acpi_evaluate_object(ec0, "IGPS", &input, NULL);
-	if (ACPI_FAILURE(status))
-		return -EIO;
-
-	return count;
-}
-static DEVICE_ATTR_RW(gpu_mode);
+/* MR fork: dGPU/MSHybrid is handled in userspace via the NVRAM
+ * OemDisplayMode (UEFI var OemMagicVariable off98, reboot-applied) —
+ * see mr-linux-console nvswitch_linux / gpu-mode. The AML IGPS/DGPS
+ * runtime path is intentionally NOT exposed (REPORT 4.8.1: MUX switch
+ * is decided at BIOS POST from off98; runtime IGPS semantics are
+ * confusing and were never fully validated). */
 
 static int uniwill_nvidia_ctgp_init(struct uniwill_data *data)
 {
@@ -1962,8 +1899,6 @@ static struct attribute *uniwill_attrs[] = {
 	&dev_attr_usb_charge_s5_toggle_enable.attr,
 	/* MR fork: custom-mode switch (same shelf as the super-key toggle) */
 	&dev_attr_custom_mode.attr,
-	/* MR fork: dGPU / MSHybrid switch (REPORT 4.8.1) */
-	&dev_attr_gpu_mode.attr,
 	/* Lightbar-related */
 	&dev_attr_rainbow_animation.attr,
 	&dev_attr_breathing_in_suspend.attr,
@@ -2025,8 +1960,7 @@ static umode_t uniwill_attr_is_visible(struct kobject *kobj, struct attribute *a
 	    attr == &dev_attr_tcc_offset.attr ||
 	    attr == &dev_attr_fan_sensitivity.attr ||
 	    attr == &dev_attr_fan_tables.attr ||
-	    attr == &dev_attr_custom_mode.attr ||
-	    attr == &dev_attr_gpu_mode.attr) {
+	    attr == &dev_attr_custom_mode.attr) {
 		if (uniwill_device_supports(data, UNIWILL_FEATURE_PLATFORM_PROFILE))
 			return attr->mode;
 	}
