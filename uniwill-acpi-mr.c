@@ -161,11 +161,16 @@
  * Only honored when the console is online (EC_ADDR_AP_OEM ENABLE_MANUAL_CTRL). */
 #define EC_ADDR_SILENT_TURBO		0x0728
 #define SILENT_TURBO_ENABLE		BIT(0)
+/* MR fork: Copilot key lock (SetCopilotKey, REPORT 4.6.1): 1 = locked. */
+#define COPILOT_KEY_LOCK		BIT(2)
 
 /* MR fork: custom mode (measured 2026-08, see REPORT 4.6.1).
  * 0x726 bit7 = EC custom-mode flag; 0x727 bit6 = custom light + detection bit. */
 #define EC_ADDR_EC_CUSTOM_FLAG		0x0726
 #define EC_CUSTOM_MODE_ENABLE		BIT(7)
+/* MR fork: power-on after AC re-insert (UserSetAcRecoverySwitch, REPORT
+ * 4.6.1): 1 = auto power-on when AC is connected. */
+#define AC_RECOVERY_ENABLE		BIT(3)
 #define EC_ADDR_AP_CUSTOM_LIGHT		0x0727
 #define AP_CUSTOM_LIGHT_ENABLE		BIT(6)
 
@@ -210,6 +215,9 @@
 #define TRIGGER_FAN_BOOST		BIT(2)
 #define TRIGGER_SILENT_MODE		BIT(3)
 #define TRIGGER_USB_CHARGING		BIT(4)
+/* MR fork: charge USB ports while the system is off (USB_Charger_ON/OFF,
+ * REPORT 4.6.1): 1 = charging enabled in S5. */
+#define USB_CHARGE_S5_ENABLE		BIT(4)
 #define RGB_APPLY_COLOR			BIT(5)
 #define RGB_LOGO_EFFECT			BIT(6)
 #define RGB_RAINBOW_EFFECT		BIT(7)
@@ -858,6 +866,114 @@ static ssize_t touchpad_toggle_enable_show(struct device *dev, struct device_att
 }
 
 static DEVICE_ATTR_RW(touchpad_toggle_enable);
+
+/* MR fork: Copilot key lock (SetCopilotKey, REPORT 4.6.1): 0x728 bit2,
+ * 1 = Copilot key locked. Same bit7-enable design family as silent turbo. */
+static ssize_t copilot_key_toggle_enable_show(struct device *dev, struct device_attribute *attr,
+					      char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int value;
+	int ret;
+
+	ret = regmap_read(data->regmap, EC_ADDR_SILENT_TURBO, &value);
+	if (ret < 0)
+		return ret;
+
+	return sysfs_emit(buf, "%d\n", !!(value & COPILOT_KEY_LOCK));
+}
+
+static ssize_t copilot_key_toggle_enable_store(struct device *dev, struct device_attribute *attr,
+					       const char *buf, size_t count)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	bool enable;
+	int ret;
+
+	ret = kstrtobool(buf, &enable);
+	if (ret < 0)
+		return ret;
+
+	ret = regmap_update_bits(data->regmap, EC_ADDR_SILENT_TURBO, COPILOT_KEY_LOCK,
+				 enable ? COPILOT_KEY_LOCK : 0);
+	if (ret < 0)
+		return ret;
+
+	return count;
+}
+static DEVICE_ATTR_RW(copilot_key_toggle_enable);
+
+/* MR fork: power-on after AC re-insert (UserSetAcRecoverySwitch, REPORT
+ * 4.6.1): 0x726 bit3, 1 = auto power-on when AC is connected. */
+static ssize_t ac_recovery_toggle_enable_show(struct device *dev, struct device_attribute *attr,
+					      char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int value;
+	int ret;
+
+	ret = regmap_read(data->regmap, EC_ADDR_EC_CUSTOM_FLAG, &value);
+	if (ret < 0)
+		return ret;
+
+	return sysfs_emit(buf, "%d\n", !!(value & AC_RECOVERY_ENABLE));
+}
+
+static ssize_t ac_recovery_toggle_enable_store(struct device *dev, struct device_attribute *attr,
+					       const char *buf, size_t count)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	bool enable;
+	int ret;
+
+	ret = kstrtobool(buf, &enable);
+	if (ret < 0)
+		return ret;
+
+	ret = regmap_update_bits(data->regmap, EC_ADDR_EC_CUSTOM_FLAG, AC_RECOVERY_ENABLE,
+				 enable ? AC_RECOVERY_ENABLE : 0);
+	if (ret < 0)
+		return ret;
+
+	return count;
+}
+static DEVICE_ATTR_RW(ac_recovery_toggle_enable);
+
+/* MR fork: charge USB ports while the system is off (USB_Charger_ON/OFF,
+ * REPORT 4.6.1): 0x767 bit4, 1 = S5 USB charging enabled. */
+static ssize_t usb_charge_s5_toggle_enable_show(struct device *dev, struct device_attribute *attr,
+						char *buf)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	unsigned int value;
+	int ret;
+
+	ret = regmap_read(data->regmap, EC_ADDR_TRIGGER, &value);
+	if (ret < 0)
+		return ret;
+
+	return sysfs_emit(buf, "%d\n", !!(value & USB_CHARGE_S5_ENABLE));
+}
+
+static ssize_t usb_charge_s5_toggle_enable_store(struct device *dev, struct device_attribute *attr,
+						 const char *buf, size_t count)
+{
+	struct uniwill_data *data = dev_get_drvdata(dev);
+	bool enable;
+	int ret;
+
+	ret = kstrtobool(buf, &enable);
+	if (ret < 0)
+		return ret;
+
+	ret = regmap_update_bits(data->regmap, EC_ADDR_TRIGGER, USB_CHARGE_S5_ENABLE,
+				 enable ? USB_CHARGE_S5_ENABLE : 0);
+	if (ret < 0)
+		return ret;
+
+	return count;
+}
+static DEVICE_ATTR_RW(usb_charge_s5_toggle_enable);
 
 static ssize_t rainbow_animation_store(struct device *dev, struct device_attribute *attr,
 				       const char *buf, size_t count)
@@ -1719,6 +1835,10 @@ static struct attribute *uniwill_attrs[] = {
 	&dev_attr_fn_lock_toggle_enable.attr,
 	&dev_attr_super_key_toggle_enable.attr,
 	&dev_attr_touchpad_toggle_enable.attr,
+	/* MR fork: system setting switches (REPORT 4.6.1) */
+	&dev_attr_copilot_key_toggle_enable.attr,
+	&dev_attr_ac_recovery_toggle_enable.attr,
+	&dev_attr_usb_charge_s5_toggle_enable.attr,
 	/* MR fork: custom-mode switch (same shelf as the super-key toggle) */
 	&dev_attr_custom_mode.attr,
 	/* Lightbar-related */
@@ -1752,6 +1872,13 @@ static umode_t uniwill_attr_is_visible(struct kobject *kobj, struct attribute *a
 
 	if (attr == &dev_attr_touchpad_toggle_enable.attr) {
 		if (uniwill_device_supports(data, UNIWILL_FEATURE_TOUCHPAD_TOGGLE))
+			return attr->mode;
+	}
+
+	if (attr == &dev_attr_copilot_key_toggle_enable.attr ||
+	    attr == &dev_attr_ac_recovery_toggle_enable.attr ||
+	    attr == &dev_attr_usb_charge_s5_toggle_enable.attr) {
+		if (uniwill_device_supports(data, UNIWILL_FEATURE_PLATFORM_PROFILE))
 			return attr->mode;
 	}
 

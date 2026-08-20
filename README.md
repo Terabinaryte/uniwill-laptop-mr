@@ -8,6 +8,9 @@ Forked to run alongside the mainline `uniwill-laptop` without module-name clashe
 Mainline upstream: https://github.com/Wer-Wolf/uniwill-laptop
 (kernel wiki docs: https://docs.kernel.org/next/wmi/devices/uniwill-laptop.html)
 
+**Full sysfs reference: [SYSFS.md](SYSFS.md)** (custom mode, fan tables,
+power limits, system switches).
+
 ## Differences vs upstream
 
 - Module renamed: `uniwill-laptop.ko` -> **`uniwill-laptop-mr.ko`**
@@ -73,6 +76,20 @@ console online bit which the driver sets itself):
 ```
 /sys/bus/platform/devices/INOU0000:00/silent_boost     # 0/1, read-write
 ```
+
+Custom-mode switch (MR fork; full activation chain = 0x706=0x41 master
+switch + 0x726 bit7 + 0x727 bit6 + 0x7C5 bit7 independent fan control +
+0x7C6 bit2 table control — missing 0x706/0x7C5 makes the EC ignore the
+tables):
+
+```
+/sys/bus/platform/devices/INOU0000:00/custom_mode      # 0/1, read-write
+```
+
+`echo 1 > custom_mode` enters custom mode and applies built-in safe
+defaults (PL 75/85/85 W + a mild default fan curve) until the userspace
+daemon writes its own `power_limits` / `fan_tables`; `echo 0` leaves
+custom mode and restores normal fan control.
 
 Custom-mode primitives (the fan tables themselves are written by the userspace
 daemon; the driver only exposes the EC registers):
